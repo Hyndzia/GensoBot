@@ -8,6 +8,7 @@ from gtts import gTTS
 #from pvrecorder import PVRecorder
 from datetime import datetime
 from dotenv import load_dotenv
+import general
 
 import time
 from io import BytesIO
@@ -34,6 +35,7 @@ intents.messages = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 now = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 channel_names_by_guild = {}
+messages_buffer = {}
 
 async def messages_handle_gejek(message):
     await message.channel.send("jurando gej")
@@ -57,42 +59,23 @@ async def on_ready():
     print(f"Zalogowano jako: {bot.user}")
 
     for guild in bot.guilds:
-        create_folder(f"G:\\DiscordBot\\servers\\{guild.name}")
-
+        general.create_folder(f"G:\\DiscordBot\\servers\\{guild.name}")
         print(f"Serwer: {guild.name}")
         print("Kanały tekstowe:")
+        channel_names = []
 
         for channel in guild.text_channels:
-            create_textfile(f"G:\\DiscordBot\\servers\\{guild.name}\\{channel.name}.txt")
-            channel_names = [channel.name]
-            channel_names_by_guild[guild.id] = channel_names
-            for name in channel_names:
-                print(f" - {name}")
+            general.create_textfile(f"G:\\DiscordBot\\servers\\{guild.name}\\{channel.name}.txt")
+            channel_names.append(channel.name)
+            print(f" - {channel.name}")
 
-def create_folder(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
-    else:
-        print(f"Directory {path} already exists!")
+        channel_names_by_guild[guild.id] = channel_names
 
-def create_textfile(path):
-    try:
-        with open(path, "x") as file:
-            file.write("")
-        print(f"Text file {path} successfully created!")
-    except FileExistsError:
-        #print(f"File {path} already exists!")
-        pass
-
-def append_to_file(path, message):
-    try:
-        with open(path, "a") as file:
-            file.write(message + "\n")
-    except FileExistsError:
-        print(f"File {path} already exists!")
-    except PathNotExistsError:
-        print(f"Path {path} does not exist!")
-
+        channel_names_by_guild[guild.id] = channel_names
+        guild_buffers = general.create_message_buffers(channel_names_by_guild[guild.id], 15)
+        messages_buffer[guild.id] = guild_buffers
+    await bot.wait_until_ready()
+    general.test_buffers(messages_buffer)
 
 @bot.event
 async def on_typing(channel, user, when):
@@ -106,13 +89,20 @@ async def on_message(message):
 
     if message.attachments:
         for attachment in message.attachments:
-            append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
+            general.append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
                            f"{now} [{message.author}] {message.content} {attachment.url}")
             print(f"{now} [{message.author}] {message.content} {attachment.url}")
     else:
-        append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
-                       f"{now} [{message.author}] {message.content}")
+        general.append_to_message_buffer(messages_buffer[message.guild.id], message.channel.name, message.content)
         print(f"[{now} [{message.author}] {message.content}")
+        print(
+            f"\n - Channel: {message.channel.name}, Buffer length: {len(messages_buffer[message.guild.id][message.channel.name])}, "
+            f"Buffer contents: {list(messages_buffer[message.guild.id][message.channel.name])}\n")
+
+    # else:
+    #     general.append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
+    #                    f"{now} [{message.author}] {message.content}")
+    #     print(f"[{now} [{message.author}] {message.content}")
 
    # if message.author.id == 120243473663262720:
    #     await handle_special_user(message)
@@ -125,6 +115,34 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
+
+@bot.event
+async def on_message2(message):
+    if message.author == bot.user:
+        return
+
+    if message.attachments:
+        for attachment in message.attachments:
+            general.append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
+                                   f"{now} [{message.author}] {message.content} {attachment.url}")
+            print(f"{now} [{message.author}] {message.content} {attachment.url}")
+    else:
+        general.append_to_message_buffer(messages_buffer[message.guild.id], message.channel.name, message.content)
+        print(f"[{now} [{message.author}] {message.content}")
+        print(f"\n   - Channel: {message.channel.name}, Buffer length: {len(messages_buffer[message.guild.id][message.channel.name])}, "
+              f"Buffer contents: {list(messages_buffer[message.guild.id][message.channel.name])}")
+
+
+    # if message.author.id == 120243473663262720:
+    #     await handle_special_user(message)
+
+    lowered = message.content.lower()
+    for trigger, handler in command_map.items():
+        if trigger in lowered:
+            await handler(message)
+            break
+
+    await bot.process_commands(message)
 
 @bot.command()
 async def test(ctx, arg):
