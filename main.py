@@ -56,22 +56,22 @@ async def on_connect():
 @bot.event
 async def on_ready():
     print(f"Zalogowano jako: {bot.user}")
+    await bot.tree.sync()
 
     for guild in bot.guilds:
-        general.create_folder(f"G:\\DiscordBot\\servers\\{guild.name}")
-        print(f"Serwer: {guild.name}")
-        print("Kanały tekstowe:")
-        channel_names = []
-
-        for channel in guild.text_channels:
-            general.create_textfile(f"G:\\DiscordBot\\servers\\{guild.name}\\{channel.name}.txt")
-            channel_names.append(channel.name)
-            print(f" - {channel.name}")
-
-        channel_names_by_guild[guild.id] = channel_names
-
-        guild_buffers = general.create_message_buffers(channel_names_by_guild[guild.id], BUFFERS_LENGTH)
+        guild_buffers = general.initialize_guild_buffers(guild, channel_names_by_guild, BUFFERS_LENGTH)
         messages_buffer[guild.id] = guild_buffers
+        await general.welcomeback_message(guild, bot)
+
+    await bot.wait_until_ready()
+    general.test_buffers(messages_buffer)
+
+@bot.event
+async def on_guild_join(guild):
+    guild_buffers = general.initialize_guild_buffers(guild, channel_names_by_guild, BUFFERS_LENGTH)
+    messages_buffer[guild.id] = guild_buffers
+
+    await general.greeting_message(guild, bot)
 
     await bot.wait_until_ready()
     general.test_buffers(messages_buffer)
@@ -79,7 +79,7 @@ async def on_ready():
 @bot.event
 async def on_typing(channel, user, when):
     if channel.id == 279581584821190665 and not user.bot:
-        await channel.send(f"{user.name} właśnie wypisuje głupoty...", delete_after=3)
+        await channel.send(f"{user.mention} właśnie wypisuje głupoty...", delete_after=3)
 
 @bot.event
 async def on_message(message):
@@ -128,9 +128,10 @@ async def test(ctx, arg):
 
 @bot.tree.command(name="roll", description="Roll the dice!")
 async def roll(interaction: discord.Interaction, start:int, stop:int):
+    print("roll")
     result = random.randrange(start, stop)
+    print("roll")
     await interaction.response.send_message(f"You have rolled {result}!")
-
 
 
 bot.run(TOKEN)

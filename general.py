@@ -15,7 +15,30 @@ from pydantic.v1 import PathNotExistsError
 from pydub import AudioSegment
 from pydub.playback import play
 from collections import deque
+import re
 
+async def greeting_message(guild, bot):
+
+    bot_member = guild.get_member(bot.user.id)
+    if bot_member is None:
+        print("Bot member not found in guild!")
+        return
+
+    for channel in guild.text_channels:
+        if channel.permissions_for(bot_member).send_messages:
+            await channel.send("Thanks for adding me!")
+            break
+
+async def welcomeback_message(guild, bot):
+    bot_member = guild.get_member(bot.user.id)
+    if bot_member is None:
+        print("Bot member not found in guild!")
+        return
+
+    for channel in guild.text_channels:
+        if channel.permissions_for(bot_member).send_messages:
+            await channel.send("And..... I'm back!")
+            break
 
 def create_folder(path):
     if not os.path.exists(path):
@@ -79,3 +102,21 @@ def test_buffers(messages_buffer):
         for channel_name, buffer in channels.items():
             print(f"   - Channel: {channel_name}, Buffer length: {len(buffer)}, Buffer contents: {list(buffer)}")
 
+def initialize_guild_buffers(guild, channel_names_by_guild, BUFFERS_LENGTH):
+    create_folder(f"G:\\DiscordBot\\servers\\{safe_name(guild.name)}")
+    print(f"Serwer: {guild.name}")
+    print("Kanały tekstowe:")
+    channel_names = []
+
+    for channel in guild.text_channels:
+        create_textfile(f"G:\\DiscordBot\\servers\\{safe_name(guild.name)}\\{safe_name(channel.name)}.txt")
+        channel_names.append(channel.name)
+        print(f" - {channel.name}")
+
+    channel_names_by_guild[guild.id] = channel_names
+
+    guild_buffers = create_message_buffers(channel_names_by_guild[guild.id], BUFFERS_LENGTH)
+    return guild_buffers
+
+def safe_name(name):
+    return re.sub(r'[\\/*?:"<>|]', '_', name)
