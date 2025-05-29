@@ -45,17 +45,21 @@ def create_message_buffers(channel_names, buffers_length):
     buffers = {buffer_name: deque(maxlen=buffers_length) for buffer_name in channel_names}
     return buffers
 
-def append_to_message_buffer(buffers, channel_name, message):
+def append_to_message_buffer(buffers, channel_name, path, message):
     try:
+        if len(buffers[channel_name]) is buffers[channel_name].maxlen:
+            append_buffer_to_file(buffers, channel_name, path)
+            buffers[channel_name].clear()
         buffers[channel_name].append(message)
+
     except KeyError:
         print(f"Channel {channel_name} does not exist!")
 
-def append_buffer_to_file(buffers, path):
+def append_buffer_to_file(buffers, channel_name, path):
     try:
         with open(path, "a", encoding="utf-8") as f:
             while True:
-                f.write(buffers[path].popleft() + "\n")
+                f.write(buffers[channel_name].popleft() + "\n")
     except KeyError:
         print(f"Brak bufora dla pliku: {path}")
     except IndexError:

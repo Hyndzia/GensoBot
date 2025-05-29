@@ -21,8 +21,6 @@ import yt_dlp # NEW
 from collections import deque # NEW
 import asyncio # NEW
 
-
-
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -36,12 +34,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 now = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 channel_names_by_guild = {}
 messages_buffer = {}
+BUFFERS_LENGTH = 15
 
 async def messages_handle_gejek(message):
-    await message.channel.send("jurando gej")
+    await message.channel.send("ty jesteś gejek")
 
 command_map = {
-    "jurando1": messages_handle_gejek,
+    "gejek": messages_handle_gejek,
     "Gejek": messages_handle_gejek,
     "gejki": messages_handle_gejek,
     "gejuś": messages_handle_gejek,
@@ -71,30 +70,34 @@ async def on_ready():
 
         channel_names_by_guild[guild.id] = channel_names
 
-        channel_names_by_guild[guild.id] = channel_names
-        guild_buffers = general.create_message_buffers(channel_names_by_guild[guild.id], 15)
+        guild_buffers = general.create_message_buffers(channel_names_by_guild[guild.id], BUFFERS_LENGTH)
         messages_buffer[guild.id] = guild_buffers
+
     await bot.wait_until_ready()
     general.test_buffers(messages_buffer)
 
 @bot.event
 async def on_typing(channel, user, when):
     if channel.id == 279581584821190665 and not user.bot:
-        await channel.send(f"{user.name} właśnie wypisuje głupoty...")
+        await channel.send(f"{user.name} właśnie wypisuje głupoty...", delete_after=3)
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
+    log_path=f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt"
+    log_message = f"{now} [{message.author}] {message.content}"
+
     if message.attachments:
         for attachment in message.attachments:
-            general.append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
-                           f"{now} [{message.author}] {message.content} {attachment.url}")
-            print(f"{now} [{message.author}] {message.content} {attachment.url}")
+            general.append_to_file(log_path, (log_message + f"{attachment.url}"))
+            print((log_message + f"{attachment.url}"))
     else:
-        general.append_to_message_buffer(messages_buffer[message.guild.id], message.channel.name, message.content)
-        print(f"[{now} [{message.author}] {message.content}")
+        general.append_to_message_buffer(messages_buffer[message.guild.id], message.channel.name,
+            log_path, log_message)
+
+        print(log_message)
         print(
             f"\n - Channel: {message.channel.name}, Buffer length: {len(messages_buffer[message.guild.id][message.channel.name])}, "
             f"Buffer contents: {list(messages_buffer[message.guild.id][message.channel.name])}\n")
@@ -116,34 +119,6 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
-@bot.event
-async def on_message2(message):
-    if message.author == bot.user:
-        return
-
-    if message.attachments:
-        for attachment in message.attachments:
-            general.append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
-                                   f"{now} [{message.author}] {message.content} {attachment.url}")
-            print(f"{now} [{message.author}] {message.content} {attachment.url}")
-    else:
-        general.append_to_message_buffer(messages_buffer[message.guild.id], message.channel.name, message.content)
-        print(f"[{now} [{message.author}] {message.content}")
-        print(f"\n   - Channel: {message.channel.name}, Buffer length: {len(messages_buffer[message.guild.id][message.channel.name])}, "
-              f"Buffer contents: {list(messages_buffer[message.guild.id][message.channel.name])}")
-
-
-    # if message.author.id == 120243473663262720:
-    #     await handle_special_user(message)
-
-    lowered = message.content.lower()
-    for trigger, handler in command_map.items():
-        if trigger in lowered:
-            await handler(message)
-            break
-
-    await bot.process_commands(message)
-
 @bot.command()
 async def test(ctx, arg):
     if arg == "hello":
@@ -152,7 +127,7 @@ async def test(ctx, arg):
         await ctx.send("nie rozumie, to po polsku?")
 
 @bot.tree.command(name="roll", description="Roll the dice!")
-async def roll(interaction: discord.Interaction, start: int, stop: int):
+async def roll(interaction: discord.Interaction, start:int, stop:int):
     result = random.randrange(start, stop)
     await interaction.response.send_message(f"You have rolled {result}!")
 
