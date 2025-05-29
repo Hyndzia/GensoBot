@@ -16,9 +16,11 @@ from pydub import AudioSegment
 from pydub.playback import play
 from collections import deque
 import re
+import asyncio
+import yt_dlp
+
 
 async def greeting_message(guild, bot):
-
     bot_member = guild.get_member(bot.user.id)
     if bot_member is None:
         print("Bot member not found in guild!")
@@ -37,7 +39,7 @@ async def welcomeback_message(guild, bot):
 
     for channel in guild.text_channels:
         if channel.permissions_for(bot_member).send_messages:
-            await channel.send("And..... I'm back!")
+            await channel.send("And..... I'm back!", delete_after=7)
             break
 
 def create_folder(path):
@@ -120,3 +122,11 @@ def initialize_guild_buffers(guild, channel_names_by_guild, BUFFERS_LENGTH):
 
 def safe_name(name):
     return re.sub(r'[\\/*?:"<>|]', '_', name)
+
+async def search_ytdlp_async(query, ydl_opts):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _extract(query, ydl_opts))
+
+def _extract(query, ydl_opts):
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(query, download=False)
