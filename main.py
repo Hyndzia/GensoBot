@@ -272,7 +272,7 @@ async def play_next_song(voice_client, guild_id, channel, _msg_flag):
         def after_play(error):
             if error:
                 print(f"Error playing {title}: {error}")
-            asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel), bot.loop)
+            asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel, _msg_flag), bot.loop)
 
         voice_client.play(source, after=after_play)
         if _msg_flag is False:
