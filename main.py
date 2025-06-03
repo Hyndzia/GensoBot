@@ -36,6 +36,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 now = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 channel_names_by_guild = {}
 messages_buffer = {}
+messages_buffer2 = {}
 BUFFERS_LENGTH = 15
 
 async def messages_handle_gejek(message):
@@ -85,6 +86,7 @@ async def on_typing(channel, user, when):
 
 @bot.event
 async def on_message(message):
+    messages_buffer2[message.guild.id] = {}
     if message.author == bot.user:
         return
 
@@ -96,13 +98,16 @@ async def on_message(message):
             general.append_to_file(log_path, (log_message + f"{attachment.url}"))
             print((log_message + f"{attachment.url}"))
     else:
-        general.append_to_message_buffer(messages_buffer[message.guild.id], message.channel.name,
-            log_path, log_message)
+        general.append_to_message_buffer(messages_buffer2,
+    message.guild.id,
+    message.channel.name,
+ log_message, 10)
 
         print(log_message)
+        buffer = messages_buffer[message.guild.id][message.channel.name]
         print(
-            f"\n - Channel: {message.channel.name}, Buffer length: {len(messages_buffer[message.guild.id][message.channel.name])}, "
-            f"Buffer contents: {list(messages_buffer[message.guild.id][message.channel.name])}\n")
+            f"\n - Channel: {message.channel.name}, Buffer length: {len(buffer)}, Buffer contents: {list(buffer)}"
+        )
 
     # else:
     #     general.append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
@@ -119,6 +124,8 @@ async def on_message(message):
             break
 
     await bot.process_commands(message)
+    # At the end of on_message:
+    general.test_buffers({message.guild.id: messages_buffer2[message.guild.id]})
 
 
 @bot.command()
@@ -246,10 +253,11 @@ async def play(interaction: discord.Interaction, song_query: str):
         await interaction.followup.send(f"Added to queue: **{title}**")
     else:
         await interaction.followup.send(f"Now playing: **{title}**")
-        await play_next_song(voice_client, guild_id, interaction.channel)
+        msg_flag = True
+        await play_next_song(voice_client, guild_id, interaction.channel, msg_flag)
 
 
-async def play_next_song(voice_client, guild_id, channel):
+async def play_next_song(voice_client, guild_id, channel, _msg_flag):
     if SONG_QUEUES[guild_id]:
         audio_url, title = SONG_QUEUES[guild_id].popleft()
 
@@ -267,7 +275,10 @@ async def play_next_song(voice_client, guild_id, channel):
             asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel), bot.loop)
 
         voice_client.play(source, after=after_play)
-        asyncio.create_task(channel.send(f"Now playing: **{title}**"))
+        if _msg_flag is False:
+            asyncio.create_task(channel.send(f"Now playing: **{title}**"))
+        else:
+            _msg_flag = False
     else:
         await voice_client.disconnect()
         SONG_QUEUES[guild_id] = deque()

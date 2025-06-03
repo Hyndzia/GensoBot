@@ -19,6 +19,8 @@ import re
 import asyncio
 import yt_dlp
 
+BUFFERS_LENGTH = 15
+
 
 async def greeting_message(guild, bot):
     bot_member = guild.get_member(bot.user.id)
@@ -70,15 +72,14 @@ def create_message_buffers(channel_names, buffers_length):
     buffers = {buffer_name: deque(maxlen=buffers_length) for buffer_name in channel_names}
     return buffers
 
-def append_to_message_buffer(buffers, channel_name, path, message):
-    try:
-        if len(buffers[channel_name]) is buffers[channel_name].maxlen:
-            append_buffer_to_file(buffers, channel_name, path)
-            buffers[channel_name].clear()
-        buffers[channel_name].append(message)
+def append_to_message_buffer(messages_buffer, guild_id, channel_name, message, maxlen=30):
+    if guild_id not in messages_buffer:
+        messages_buffer[guild_id] = {}
 
-    except KeyError:
-        print(f"Channel {channel_name} does not exist!")
+    if channel_name not in messages_buffer[guild_id]:
+        messages_buffer[guild_id][channel_name] = deque(maxlen=maxlen)
+
+    messages_buffer[guild_id][channel_name].append(message)
 
 def append_buffer_to_file(buffers, channel_name, path):
     try:
@@ -111,9 +112,9 @@ def initialize_guild_buffers(guild, channel_names_by_guild, BUFFERS_LENGTH):
     channel_names = []
 
     for channel in guild.text_channels:
-        create_textfile(f"G:\\DiscordBot\\servers\\{safe_name(guild.name)}\\{safe_name(channel.name)}.txt")
         channel_names.append(channel.name)
         print(f" - {channel.name}")
+        create_textfile(f"G:\\DiscordBot\\servers\\{safe_name(guild.name)}\\{safe_name(channel.name)}.txt")
 
     channel_names_by_guild[guild.id] = channel_names
 
@@ -130,3 +131,26 @@ async def search_ytdlp_async(query, ydl_opts):
 def _extract(query, ydl_opts):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(query, download=False)
+
+def test_dynamic_buffering():
+    from collections import defaultdict
+
+    # Simulate messages_buffer structure: guild_id -> channel_name -> deque
+    messages_buffer = defaultdict(dict)
+    guild_id = 1234567890
+    BUFFERS_LENGTH = 5
+
+    # Simulated message input (channel_name: [messages])
+    test_data = {
+        "general": ["Hello", "How are you?", "Test1", "Test2", "Test3"],
+        "bot-commands": ["!play song", "!pause", "!resume"],
+    }
+def safe_append_to_buffer(messages_buffer, guild_id, channel_name, message, maxlen=30):
+    if guild_id not in messages_buffer:
+        messages_buffer[guild_id] = {}
+
+    if channel_name not in messages_buffer[guild_id]:
+        messages_buffer[guild_id][channel_name] = deque(maxlen=maxlen)
+
+    messages_buffer[guild_id][channel_name].append(message)
+
