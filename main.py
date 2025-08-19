@@ -1,5 +1,7 @@
 import random
 
+from flask import Flask
+import threading
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -69,6 +71,17 @@ async def on_ready():
     await bot.wait_until_ready()
     general.test_buffers(messages_buffer)
 
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running!", 200
+
+def run_web():
+    app.run(host="0.0.0.0", port=7777)
+
+threading.Thread(target=run_web).start()
+
 @bot.event
 async def on_guild_join(guild):
     guild_buffers = general.initialize_guild_buffers(guild, channel_names_by_guild, BUFFERS_LENGTH)
@@ -131,7 +144,7 @@ async def on_message(message):
 @bot.command()
 async def test(ctx, arg):
     if arg == "hello":
-        await ctx.send("spierdalaj")
+        await ctx.send("")
     else:
         await ctx.send("nie rozumie, to po polsku?")
 
@@ -225,10 +238,11 @@ async def play(interaction: discord.Interaction, song_query: str):
         await voice_client.move_to(voice_channel)
 
     ydl_options = {
-        "format": "bestaudio[abr<=96]/bestaudio",
+        "format": "bestaudio/best",
         "noplaylist": True,
         "youtube_include_dash_manifest": False,
         "youtube_include_hls_manifest": False,
+        "cookiefile": "/home/ubuntu/GensoBot/GensoBot/ck.txt",
     }
 
     query = "ytsearch1: " + song_query
@@ -267,7 +281,7 @@ async def play_next_song(voice_client, guild_id, channel, _msg_flag):
             # Remove executable if FFmpeg is in PATH
         }
 
-        source = discord.FFmpegOpusAudio(audio_url, **ffmpeg_options, executable="G:\\DiscordBot\\bin\\ffmpeg.exe")
+        source = discord.FFmpegOpusAudio(audio_url, **ffmpeg_options)
 
         def after_play(error):
             if error:
