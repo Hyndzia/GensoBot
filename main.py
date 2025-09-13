@@ -1,18 +1,14 @@
 import random
-
 from flask import Flask
 import threading
 import discord
 from discord.ext import commands
 from discord import app_commands
 import os
-from gtts import gTTS
-#from pvrecorder import PVRecorder
 from datetime import datetime
 from dotenv import load_dotenv
 import general
 import nacl
-
 import time
 from io import BytesIO
 
@@ -103,7 +99,14 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    log_path=f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt"
+    #log_path=f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt"
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))  # folder where main.py lives
+    log_path = os.path.join(base_dir, "servers", message.guild.name, f"{message.channel.name}.txt")
+
+    # make sure the parent folders exist before writing
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
     log_message = f"{now} [{message.author}] {message.content}"
 
     if message.attachments:
@@ -111,24 +114,13 @@ async def on_message(message):
             general.append_to_file(log_path, (log_message + f"{attachment.url}"))
             print((log_message + f"{attachment.url}"))
     else:
-        general.append_to_message_buffer(messages_buffer2,
-    message.guild.id,
-    message.channel.name,
- log_message, 10)
+        general.append_to_message_buffer(messages_buffer2, message.guild.id, message.channel.name, log_message, 10)
 
         print(log_message)
         buffer = messages_buffer[message.guild.id][message.channel.name]
         print(
             f"\n - Channel: {message.channel.name}, Buffer length: {len(buffer)}, Buffer contents: {list(buffer)}"
         )
-
-    # else:
-    #     general.append_to_file(f"G:\\DiscordBot\\servers\\{message.guild.name}\\{message.channel.name}.txt\\",
-    #                    f"{now} [{message.author}] {message.content}")
-    #     print(f"[{now} [{message.author}] {message.content}")
-
-   # if message.author.id == 120243473663262720:
-   #     await handle_special_user(message)
 
     lowered = message.content.lower()
     for trigger, handler in command_map.items():
@@ -242,7 +234,7 @@ async def play(interaction: discord.Interaction, song_query: str):
         "noplaylist": True,
         "youtube_include_dash_manifest": False,
         "youtube_include_hls_manifest": False,
-        "cookiefile": "/home/ubuntu/GensoBot/GensoBot/ck.txt",
+        #"cookiefile": "/home/ubuntu/GensoBot/GensoBot/ck.txt",
     }
 
     query = "ytsearch1: " + song_query
@@ -296,6 +288,53 @@ async def play_next_song(voice_client, guild_id, channel, _msg_flag):
     else:
         await voice_client.disconnect()
         SONG_QUEUES[guild_id] = deque()
+
+
+@bot.tree.command(name="radio", description="Play the Shinpu radio stream")
+async def radio(interaction: discord.Interaction):
+    # defer the response (keeps the interaction alive while we join/connect)
+    await interaction.response.defer()
+
+    # require the user to be in a voice channel
+    if interaction.user.voice is None or interaction.user.voice.channel is None:
+        await interaction.followup.send("You must be in a voice channel to use this command.")
+        return
+
+    voice_channel = interaction.user.voice.channel
+    voice_client = interaction.guild.voice_client
+
+    # join or move to the user's voice channel
+    try:
+        if voice_client is None:
+            voice_client = await voice_channel.connect()
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't join the voice channel: {e}")
+        return
+
+    # radio stream URL and FFmpeg options suited for reconnecting live streams
+    radio_url = "https://radio.shinpu.top/radio.ogg"
+    ffmpeg_options = {
+        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        "options": "-vn -c:a libopus -b:a 96k"
+    }
+
+    # create the audio source (use FFmpegOpusAudio for Opus-in-Ogg streams)
+    source = discord.FFmpegOpusAudio(radio_url, **ffmpeg_options)
+
+    # stop any current playback and play the radio stream
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+
+    # small after-callback to log errors if any
+    def _after_play(error):
+        if error:
+            print(f"Radio playback error: {error}")
+
+    voice_client.play(source, after=_after_play)
+
+    await interaction.followup.send("📻 Now streaming: **Radio Shinpu**")
 
 
 bot.run(TOKEN)

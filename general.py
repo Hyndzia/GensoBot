@@ -2,18 +2,11 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import os
-from gtts import gTTS
-#from pvrecorder import PVRecorder
 import datetime
-from openai import OpenAI
 from dotenv import load_dotenv
-
 import time
 from io import BytesIO
-
 from pydantic.v1 import PathNotExistsError
-from pydub import AudioSegment
-from pydub.playback import play
 from collections import deque
 import re
 import asyncio
@@ -59,14 +52,25 @@ def create_textfile(path):
         #print(f"File {path} already exists!")
         pass
 
+# def append_to_file(path, message):
+#     try:
+#         with open(path, "a") as file:
+#             file.write(message + "\n")
+#     except FileExistsError:
+#         print(f"File {path} already exists!")
+#     except PathNotExistsError:
+#         print(f"Path {path} does not exist!")
+
 def append_to_file(path, message):
+    # ensure parent folder exists
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
     try:
-        with open(path, "a") as file:
+        with open(path, "a", encoding="utf-8") as file:
             file.write(message + "\n")
-    except FileExistsError:
-        print(f"File {path} already exists!")
-    except PathNotExistsError:
-        print(f"Path {path} does not exist!")
+    except Exception as e:
+        print(f"Error writing to {path}: {e}")
+
 
 def create_message_buffers(channel_names, buffers_length):
     buffers = {buffer_name: deque(maxlen=buffers_length) for buffer_name in channel_names}
@@ -106,7 +110,8 @@ def test_buffers(messages_buffer):
             print(f"   - Channel: {channel_name}, Buffer length: {len(buffer)}, Buffer contents: {list(buffer)}")
 
 def initialize_guild_buffers(guild, channel_names_by_guild, BUFFERS_LENGTH):
-    create_folder(f"G:\\DiscordBot\\servers\\{safe_name(guild.name)}")
+    #create_folder(f"F:\\DiscordBot\\servers\\{safe_name(guild.name)}")
+    create_folder(os.path.join(os.path.dirname(os.path.abspath(__file__)), "servers", safe_name(guild.name)))
     print(f"Serwer: {guild.name}")
     print("Kanały tekstowe:")
     channel_names = []
@@ -114,7 +119,9 @@ def initialize_guild_buffers(guild, channel_names_by_guild, BUFFERS_LENGTH):
     for channel in guild.text_channels:
         channel_names.append(channel.name)
         print(f" - {channel.name}")
-        create_textfile(f"G:\\DiscordBot\\servers\\{safe_name(guild.name)}\\{safe_name(channel.name)}.txt")
+        #create_textfile(f"F:\\DiscordBot\\servers\\{safe_name(guild.name)}\\{safe_name(channel.name)}.txt")
+        base_dir = os.path.dirname(os.path.abspath(__file__))  # folder where main.py lives
+        create_textfile(os.path.join(base_dir, "servers", safe_name(guild.name), f"{safe_name(channel.name)}.txt"))
 
     channel_names_by_guild[guild.id] = channel_names
 
