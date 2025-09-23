@@ -155,19 +155,15 @@ async def skip(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
 
     if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
-        # Stop current playback
-        voice_client.stop()
-
-        # If there’s something left in the queue, play it
-        if SONG_QUEUES.get(guild_id) and SONG_QUEUES[guild_id]:
-            await interaction.response.send_message("⏭ Skipped! Playing the next track...")
-            await play_next_song(voice_client, guild_id, interaction.channel, True)
-        else:
-            await interaction.response.send_message("⏭ Skipped! No more songs in the queue.")
+        await interaction.response.send_message("⏭ Skipped!")
+        voice_client.stop()  # triggers after callback → play_next_song
     else:
         await interaction.response.send_message("Not playing anything to skip.")
-
-
+        
+def after_play(error):
+    if error:
+        print(f"Error playing {title}: {error}")
+    asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel, _msg_flag), bot.loop)
 @bot.tree.command(name="pause", description="Pause the currently playing song.")
 async def pause(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
@@ -253,7 +249,10 @@ YDL_OPTIONS = {
 
 async def extract_info_async(query):
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(YDL_OPTIONS).extract_info(query, download=False))
+    def _extract():
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+            return ydl.extract_info(query, download=False)
+    return await loop.run_in_executor(None, _extract)
 
 @bot.tree.command(name="play", description="Play a song or playlist, or add it to the queue.")
 @app_commands.describe(song_query="Search query or playlist URL")
@@ -274,35 +273,32 @@ async def play(interaction: discord.Interaction, song_query: str):
 
     # extract track or playlist info
     info = await extract_info_async(song_query)
-
     guild_id = str(interaction.guild_id)
+
     if SONG_QUEUES.get(guild_id) is None:
         SONG_QUEUES[guild_id] = deque()
 
     added_titles = []
 
-    if "entries" in info:  # playlist or search result
-        for entry in info["entries"]:
-            if entry:
-                url = entry.get("url")
-                title = entry.get("title", "Untitled")
-                SONG_QUEUES[guild_id].append((url, title))
-                added_titles.append(title)
-    else:  # single track
-        url = info["url"]
-        title = info.get("title", "Untitled")
-        SONG_QUEUES[guild_id].append((url, title))
-        added_titles.append(title)
+    # Handle playlist or single track
+    entries = info.get("entries", [info])
+    for entry in entries:
+        if entry:
+            url = entry.get("url")
+            title = entry.get("title", "Untitled")
+            SONG_QUEUES[guild_id].append((url, title))
+            added_titles.append(title)
 
-    # feedback to user
+    # Feedback to user
     if len(added_titles) > 1:
         await interaction.followup.send(f"🎶 Added **{len(added_titles)}** tracks to the queue.")
     else:
-        if voice_client.is_playing() or voice_client.is_paused():
-            await interaction.followup.send(f"Added to queue: **{added_titles[0]}**")
-        else:
-            await interaction.followup.send(f"Now playing: **{added_titles[0]}**")
-            await play_next_song(voice_client, guild_id, interaction.channel, True)
+        await interaction.followup.send(f"Added to queue: **{added_titles[0]}**")
+
+    # Start playing if nothing is currently playing
+    if not voice_client.is_playing() and not voice_client.is_paused():
+        await play_next_song(voice_client, guild_id, interaction.channel, True)
+
 
 async def play_next_song(voice_client, guild_id, channel, _msg_flag):
     if SONG_QUEUES[guild_id]:
@@ -310,9 +306,7 @@ async def play_next_song(voice_client, guild_id, channel, _msg_flag):
 
         ffmpeg_options = {
             "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": "-vn",
-            #"options": "-vn -c:a libopus -b:a 96k",
-            # Remove executable if FFmpeg is in PATH
+            "options": "-vn"
         }
 
         source = discord.FFmpegOpusAudio(audio_url, **ffmpeg_options)
@@ -320,14 +314,21 @@ async def play_next_song(voice_client, guild_id, channel, _msg_flag):
         def after_play(error):
             if error:
                 print(f"Error playing {title}: {error}")
-            asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel, _msg_flag), bot.loop)
+            # Schedule next song
+            asyncio.run_coroutine_threadsafe(
+                play_next_song(voice_client, guild_id, channel, True), bot.loop
+            )
 
         voice_client.play(source, after=after_play)
-        if _msg_flag is False:
+
+        # Send now playing message
+        if _msg_flag:
             asyncio.create_task(channel.send(f"Now playing: **{title}**"))
-        else:
             _msg_flag = False
+        else:
+            asyncio.create_task(channel.send(f"Now playing: **{title}**"))
     else:
+        # Queue empty → disconnect
         await voice_client.disconnect()
         SONG_QUEUES[guild_id] = deque()
 
