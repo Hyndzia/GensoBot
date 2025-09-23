@@ -209,7 +209,20 @@ async def stop(interaction: discord.Interaction):
     # (Optional) Disconnect from the channel
     await voice_client.disconnect()
 
-
+ YDL_OPTIONS = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "youtube_include_dash_manifest": False,
+        "youtube_include_hls_manifest": False,
+        "extract_flat": False,
+        "source_address" : "0.0.0.0"
+        "default_search": "ytsearch1",
+        #"cookiefile": "/home/ubuntu/GensoBot/GensoBot/ck.txt",
+    }
+    
+async def extract_info_async(query):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(YDL_OPTIONS).extract_info(query, download=False))
 
 @bot.tree.command(name="play", description="Play a song or add it to the queue.")
 @app_commands.describe(song_query="Search query")
@@ -229,25 +242,13 @@ async def play(interaction: discord.Interaction, song_query: str):
     elif voice_channel != voice_client.channel:
         await voice_client.move_to(voice_channel)
 
-    ydl_options = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "youtube_include_dash_manifest": False,
-        "youtube_include_hls_manifest": False,
-        #"cookiefile": "/home/ubuntu/GensoBot/GensoBot/ck.txt",
-    }
+   info = await extract_info_async(song_query)
 
-    query = "ytsearch1: " + song_query
-    results = await general.search_ytdlp_async(query, ydl_options)
-    tracks = results.get("entries", [])
+    if "entries" in info:
+        info = info["entries"][0]  
 
-    if tracks is None or len(tracks) == 0:
-        await interaction.followup.send("No results found.")
-        return
-
-    first_track = tracks[0]
-    audio_url = first_track["url"]
-    title = first_track.get("title", "Untitled")
+    stream_url = info["url"]       
+    title = info.get("title", "Untitled")
 
     guild_id = str(interaction.guild_id)
     if SONG_QUEUES.get(guild_id) is None:
@@ -269,7 +270,8 @@ async def play_next_song(voice_client, guild_id, channel, _msg_flag):
 
         ffmpeg_options = {
             "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": "-vn -c:a libopus -b:a 96k",
+            "options": "-vn",
+            #"options": "-vn -c:a libopus -b:a 96k",
             # Remove executable if FFmpeg is in PATH
         }
 
