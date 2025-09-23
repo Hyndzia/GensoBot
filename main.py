@@ -12,6 +12,8 @@ import nacl
 import time
 from io import BytesIO
 
+import yt_dlp
+
 from pydantic.v1 import PathNotExistsError
 from pydub import AudioSegment
 from pydub.playback import play
@@ -188,44 +190,70 @@ async def resume(interaction: discord.Interaction):
     voice_client.resume()
     await interaction.response.send_message("Playback resumed!")
 
+
+
 @bot.tree.command(name="stop", description="Stop playback and clear the queue.")
 async def stop(interaction: discord.Interaction):
-    await interaction.response.send_message("Stopped playback and disconnected!")
     voice_client = interaction.guild.voice_client
 
-    # Check if the bot is in a voice channel
+    # Check connection first
     if not voice_client or not voice_client.is_connected():
-        return await interaction.response.send_message("I'm not connected to any voice channel.")
+        await interaction.response.send_message("I'm not connected to any voice channel.")
+        return
 
-    # Clear the guild's queue
+    # Stop playback and clear queue
     guild_id_str = str(interaction.guild_id)
     if guild_id_str in SONG_QUEUES:
         SONG_QUEUES[guild_id_str].clear()
 
-    # If something is playing or paused, stop it
     if voice_client.is_playing() or voice_client.is_paused():
         voice_client.stop()
 
-    # (Optional) Disconnect from the channel
+    # Send confirmation first BEFORE disconnecting
+    await interaction.response.send_message("Stopped playback, cleared the queue, and disconnected!")
+
+    # Then disconnect safely
     await voice_client.disconnect()
 
- YDL_OPTIONS = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "youtube_include_dash_manifest": False,
-        "youtube_include_hls_manifest": False,
-        "extract_flat": False,
-        "source_address" : "0.0.0.0"
-        "default_search": "ytsearch1",
-        #"cookiefile": "/home/ubuntu/GensoBot/GensoBot/ck.txt",
-    }
+
+
+
+
+#YDL_OPTIONS = {
+#    "format": "bestaudio/best",
+#    "noplaylist": True,
+#    "youtube_include_dash_manifest": False,
+#    "youtube_include_hls_manifest": False,
+#    "extract_flat": False,
+#    "source_address" : "0.0.0.0",
+#    "default_search": "ytsearch1",
+#    "cookiefile": "/home/debian/GensoBot/ck.txt",
+#}
+ 
+
+YDL_OPTIONS = {
+    "format": "bestaudio/best",
+    #"format": "bestaudio[ext=webm]/bestaudio/best",
     
+    "noplaylist": True,
+    #"quiet": True,
+    "extract_flat": False,
+    "default_search": "ytsearch1",
+    "skip_download": True,
+    "ignore-errors": True,
+    "nocheckcertificate": True,
+    "cookiefile": "/home/debian/GensoBot/ck.txt",
+}
+
+
+
+
 async def extract_info_async(query):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(YDL_OPTIONS).extract_info(query, download=False))
 
-@bot.tree.command(name="play", description="Play a song or add it to the queue.")
-@app_commands.describe(song_query="Search query")
+@bot.tree.command(name="play", description="Play a song or playlist, or add it to the queue.")
+@app_commands.describe(song_query="Search query or playlist URL")
 async def play(interaction: discord.Interaction, song_query: str):
     await interaction.response.defer()
 
@@ -234,7 +262,6 @@ async def play(interaction: discord.Interaction, song_query: str):
         return
 
     voice_channel = interaction.user.voice.channel
-
     voice_client = interaction.guild.voice_client
 
     if voice_client is None:
@@ -242,27 +269,37 @@ async def play(interaction: discord.Interaction, song_query: str):
     elif voice_channel != voice_client.channel:
         await voice_client.move_to(voice_channel)
 
-   info = await extract_info_async(song_query)
-
-    if "entries" in info:
-        info = info["entries"][0]  
-
-    stream_url = info["url"]       
-    title = info.get("title", "Untitled")
+    # extract track or playlist info
+    info = await extract_info_async(song_query)
 
     guild_id = str(interaction.guild_id)
     if SONG_QUEUES.get(guild_id) is None:
         SONG_QUEUES[guild_id] = deque()
 
-    SONG_QUEUES[guild_id].append((audio_url, title))
+    added_titles = []
 
-    if voice_client.is_playing() or voice_client.is_paused():
-        await interaction.followup.send(f"Added to queue: **{title}**")
+    if "entries" in info:  # playlist or search result
+        for entry in info["entries"]:
+            if entry:
+                url = entry.get("url")
+                title = entry.get("title", "Untitled")
+                SONG_QUEUES[guild_id].append((url, title))
+                added_titles.append(title)
+    else:  # single track
+        url = info["url"]
+        title = info.get("title", "Untitled")
+        SONG_QUEUES[guild_id].append((url, title))
+        added_titles.append(title)
+
+    # feedback to user
+    if len(added_titles) > 1:
+        await interaction.followup.send(f"🎶 Added **{len(added_titles)}** tracks to the queue.")
     else:
-        await interaction.followup.send(f"Now playing: **{title}**")
-        msg_flag = True
-        await play_next_song(voice_client, guild_id, interaction.channel, msg_flag)
-
+        if voice_client.is_playing() or voice_client.is_paused():
+            await interaction.followup.send(f"Added to queue: **{added_titles[0]}**")
+        else:
+            await interaction.followup.send(f"Now playing: **{added_titles[0]}**")
+            await play_next_song(voice_client, guild_id, interaction.channel, True)
 
 async def play_next_song(voice_client, guild_id, channel, _msg_flag):
     if SONG_QUEUES[guild_id]:
@@ -336,7 +373,7 @@ async def radio(interaction: discord.Interaction):
 
     voice_client.play(source, after=_after_play)
 
-    await interaction.followup.send("📻 Now streaming: **Radio Shinpu**")
+    await interaction.followup.send("📻 Now streaming: **HikiNeet Radio**")
 
 
 bot.run(TOKEN)
