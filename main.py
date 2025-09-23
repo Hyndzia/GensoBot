@@ -151,12 +151,22 @@ async def roll(interaction: discord.Interaction, start:int, stop:int):
 
 @bot.tree.command(name="skip", description="Skips the current playing song")
 async def skip(interaction: discord.Interaction):
-    if interaction.guild.voice_client and (
-            interaction.guild.voice_client.is_playing() or interaction.guild.voice_client.is_paused()):
-        interaction.guild.voice_client.stop()
-        await interaction.response.send_message("Skipped the current song.")
+    voice_client = interaction.guild.voice_client
+    guild_id = str(interaction.guild_id)
+
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        # Stop current playback
+        voice_client.stop()
+
+        # If there’s something left in the queue, play it
+        if SONG_QUEUES.get(guild_id) and SONG_QUEUES[guild_id]:
+            await interaction.response.send_message("⏭ Skipped! Playing the next track...")
+            await play_next_song(voice_client, guild_id, interaction.channel, True)
+        else:
+            await interaction.response.send_message("⏭ Skipped! No more songs in the queue.")
     else:
         await interaction.response.send_message("Not playing anything to skip.")
+
 
 @bot.tree.command(name="pause", description="Pause the currently playing song.")
 async def pause(interaction: discord.Interaction):
@@ -215,10 +225,6 @@ async def stop(interaction: discord.Interaction):
     # Then disconnect safely
     await voice_client.disconnect()
 
-
-
-
-
 #YDL_OPTIONS = {
 #    "format": "bestaudio/best",
 #    "noplaylist": True,
@@ -244,9 +250,6 @@ YDL_OPTIONS = {
     "nocheckcertificate": True,
     "cookiefile": "/home/debian/GensoBot/ck.txt",
 }
-
-
-
 
 async def extract_info_async(query):
     loop = asyncio.get_event_loop()
