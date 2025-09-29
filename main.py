@@ -20,6 +20,7 @@ from pydub.playback import play
 
 from collections import deque
 import asyncio
+import aiohttp
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -378,7 +379,38 @@ async def radio(interaction: discord.Interaction):
     voice_client.play(source, after=_after_play)
 
     await interaction.followup.send("📻 Now streaming: **HikiNeet Radio**")
+    
+ICECAST_STATUS_URL = "https://radio.shinpu.top/status-json.xsl"
+@bot.tree.command(name="radio_status", description="Show current radio song info")
+async def radio_status(interaction: discord.Interaction):
+    await interaction.response.defer()
 
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(ICECAST_STATUS_URL) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send("⚠️ Could not fetch radio status.")
+                    return
+                data = await resp.json()
+
+        # Navigate JSON structure
+        sources = data.get("icestats", {}).get("source", [])
+        if isinstance(sources, dict):  # when only one mountpoint
+            sources = [sources]
+
+        song_info = None
+        for src in sources:
+            if src.get("listenurl", "").endswith("radio.ogg"):
+                song_info = src.get("title", None)
+                break
+
+        if song_info:
+            await interaction.followup.send(f"📻 Now playing on HikiNeet Radio: **{song_info}**")
+        else:
+            await interaction.followup.send("📻 No current song metadata available.")
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error fetching radio status: {e}")
 
 bot.run(TOKEN)
 
