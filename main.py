@@ -238,7 +238,7 @@ YDL_OPTIONS = {
     "format": "bestaudio/best",
     #"format": "bestaudio[ext=webm]/bestaudio/best",
     
-    "noplaylist": True,
+    "noplaylist": False,
     #"quiet": True,
     "extract_flat": False,
     "default_search": "ytsearch1",
