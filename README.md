@@ -16,7 +16,7 @@ GensoBot provides music playback, radio streaming, utility/fun commands, GIFs, m
 * 🌐 Built-in HTTP endpoint for uptime/health checks
 * 🔊 Discord voice channel support
 
-## 📋 Commands
+## Commands
 
 All main commands are **Discord slash commands** (`/`). The bot synchronizes its application commands when it starts.
 
@@ -194,7 +194,7 @@ Messages are buffered before being processed, while messages containing attachme
 
 Keep this behavior in mind when deploying the bot on a server where message privacy is important.
 
-## 🌐 Health Check
+## Health Check
 
 GensoBot also starts a small Flask web server on:
 
@@ -210,7 +210,7 @@ Bot is running!
 
 This can be used by hosting platforms or monitoring services to determine whether the process is alive.
 
-## 🛠️ Troubleshooting
+## Troubleshooting
 
 ### Slash commands aren't appearing
 
@@ -248,7 +248,7 @@ Also verify that your virtual environment is active and dependencies are install
 pip install -r requirements.txt
 ```
 
-## 🧑‍💻 Development
+## Development
 
 Run the bot directly during development:
 
