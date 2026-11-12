@@ -6,6 +6,6 @@ servers/
 
 __pycache__/
 
-ck.txt
+cookies.txt
 
 .env
