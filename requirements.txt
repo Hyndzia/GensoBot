@@ -4,14 +4,10 @@
 #   * ffmpeg           -> https://ffmpeg.org  (must be on PATH)
 #   * deno  (or node v22+) -> https://deno.com  (must be on PATH of the process running the bot;
 #                             yt-dlp needs a JS runtime to decode YouTube streams)
-#
-# Keep yt-dlp fresh - YouTube changes break old versions within weeks:
-#   pip install -U "yt-dlp[default]"
 
-discord.py[voice]>=2.7.1      # [voice] = PyNaCl + davey (Discord now requires E2EE voice)
-davey>=0.1.6,<0.2             # TEMPORARY: davey 0.2.0 + discord.py 2.7.1 = bot plays in total silence.
-                              # Remove this line once discord.py ships support for davey 0.2.
-yt-dlp[default]               # [default] includes yt-dlp-ejs, the YouTube challenge solver
+discord.py[voice]>=2.7.1      
+davey>=0.1.6,<0.2                          
+yt-dlp[default]               
 aiohttp>=3.9
 python-dotenv>=1.0
 Flask>=3.0
