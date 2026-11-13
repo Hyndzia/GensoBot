@@ -9,3 +9,5 @@ __pycache__/
 cookies.txt
 
 .env
+
+.python-version
