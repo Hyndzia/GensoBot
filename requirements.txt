@@ -9,6 +9,8 @@
 #   pip install -U "yt-dlp[default]"
 
 discord.py[voice]>=2.7.1      # [voice] = PyNaCl + davey (Discord now requires E2EE voice)
+davey>=0.1.6,<0.2             # TEMPORARY: davey 0.2.0 + discord.py 2.7.1 = bot plays in total silence.
+                              # Remove this line once discord.py ships support for davey 0.2.
 yt-dlp[default]               # [default] includes yt-dlp-ejs, the YouTube challenge solver
 aiohttp>=3.9
 python-dotenv>=1.0

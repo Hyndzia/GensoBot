@@ -1,10 +1,13 @@
 import asyncio
 import importlib.util
+import ipaddress
 import os
 import random
 import re
 import shlex
 import shutil
+import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -12,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -53,6 +57,12 @@ BUFFERS_LENGTH = 15
 
 SONG_QUEUES = {}   # guild_id (int) -> deque[Track]
 PLAY_LOCKS = {}    # guild_id (int) -> asyncio.Lock
+RADIO_ACTIVE = {}  # guild_id (int) -> (station name, token), while a radio stream is playing
+LOOP_MODES = {}      # guild_id (int) -> "song" | "queue"  (missing = loop off)
+STOP_REASON = {}     # guild_id (int) -> "skip" | "discard", set when a track is stopped on purpose
+BASS_LEVELS = {}     # guild_id (int) -> "low" | "medium" | "high"  (missing = bass boost off)
+PLAYBACK = {}        # guild_id (int) -> {"track", "t0", "paused_at"}: lets us restart a song at the same position
+BASS_PRESETS = {"low": 6, "medium": 10, "high": 14}   # gain in dB
 
 
 def stamp():
@@ -206,10 +216,14 @@ YDL_OPTIONS_FULL = {
     "extract_flat": False,
 }
 
-FFMPEG_BEFORE = (
-    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-    "-protocol_whitelist file,http,https,tcp,tls,crypto,m3u8,hls"
-)
+FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+
+# Radio URLs come from Discord users, so ffmpeg may only speak plain http(s) for them
+# (no file://, no concat:, etc.).
+FFMPEG_RADIO_BEFORE = FFMPEG_BEFORE + " -protocol_whitelist http,https,tcp,tls,crypto"
+
+DEFAULT_RADIO_NAME = "HikiNeet Radio"
+DEFAULT_RADIO_URL = "https://radio.shinpu.top/radio.ogg"
 
 # YouTube answers that retrying will never fix
 PERMANENT_ERROR_MARKERS = (
@@ -228,6 +242,7 @@ class Track:
     stream_url: Optional[str] = None
     headers: dict = field(default_factory=dict)
     resolved_at: float = 0.0
+    looped: bool = False   # True while being replayed by /loop (no 'Now playing' spam)
 
     def stream_is_fresh(self):
         return bool(self.stream_url) and (time.time() - self.resolved_at) < STREAM_URL_TTL
@@ -349,16 +364,27 @@ async def ensure_stream(track):
     track.stream_url, track.headers, track.resolved_at = url, headers, time.time()
 
 
-def make_audio_source(track):
+def audio_options(guild_id):
+    """ffmpeg output options. Bass boost is a low-shelf EQ plus a limiter so it doesn't clip."""
+    level = BASS_LEVELS.get(guild_id)
+    if not level:
+        return "-vn"
+    return f"-vn -af bass=g={BASS_PRESETS[level]}:f=100:w=0.6,alimiter=limit=0.9"
+
+
+def make_audio_source(track, guild_id, seek=0.0):
     """ffmpeg must send the same HTTP headers (User-Agent etc.) that yt-dlp used to
     get the URL - otherwise googlevideo answers 403. This is exactly what yt-dlp's
     own ffmpeg downloader does and what the old bot code was missing."""
     before = FFMPEG_BEFORE
+    if seek >= 1:
+        before += f" -ss {seek:.1f}"
     headers = {k: v for k, v in (track.headers or {}).items() if k.lower() != "accept-encoding"}
     if headers:
         blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         before += f" -headers {shlex.quote(blob)}"
-    return discord.FFmpegOpusAudio(track.stream_url, bitrate=96, before_options=before, options="-vn")
+    return discord.FFmpegOpusAudio(track.stream_url, bitrate=96, before_options=before,
+                                   options=audio_options(guild_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -366,9 +392,115 @@ def make_audio_source(track):
 # --------------------------------------------------------------------------- #
 
 async def safe_disconnect(guild):
+    RADIO_ACTIVE.pop(guild.id, None)
     vc = guild.voice_client
     if vc is not None and vc.is_connected():
         await vc.disconnect()
+
+
+async def join_user_channel(interaction):
+    """Joins (or moves to) the voice channel of whoever ran the command.
+    Returns the VoiceClient, or None after telling the user what went wrong."""
+    if interaction.guild is None:
+        await interaction.followup.send("This command only works in a server.")
+        return None
+
+    member = interaction.guild.get_member(interaction.user.id) or interaction.user
+    voice_state = getattr(member, "voice", None)
+    if voice_state is None or voice_state.channel is None:
+        await interaction.followup.send("You must be in a voice channel to use this command.")
+        return None
+
+    voice_channel = voice_state.channel
+
+    # The #1 reason for "it joined but I hear nothing": no Speak permission.
+    perms = voice_channel.permissions_for(interaction.guild.me)
+    missing = [name for name, ok in (("Connect", perms.connect), ("Speak", perms.speak),
+                                           ("Use Voice Activity", perms.use_voice_activation)) if not ok]
+    if missing:
+        await interaction.followup.send(
+            f"I'm missing the **{' / '.join(missing)}** permission in **{voice_channel.name}**, "
+            "so you would not hear me. Fix the channel permissions and try again."
+        )
+        return None
+
+    voice_client = interaction.guild.voice_client
+    try:
+        if voice_client is None:
+            voice_client = await voice_channel.connect(timeout=30.0, self_deaf=True)
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
+    except Exception as e:
+        print(f"Voice connect error: {e!r}")
+        await interaction.followup.send(f"Couldn't join the voice channel: {e}")
+        return None
+
+    print(f"[voice] connected to '{voice_channel.name}' in '{interaction.guild.name}'")
+    return voice_client
+
+
+def report_quick_exit(channel, label, started, error, min_life=3.0):
+    """If ffmpeg dies within a few seconds the stream never really played.
+    Say so in the chat instead of failing silently (details are in the console)."""
+    lived = time.monotonic() - started
+    failed = bool(error) or lived < min_life
+    if failed:
+        reason = f"error: {error}" if error else f"it ended after {lived:.1f}s"
+        print(f"[voice] '{label}' stopped early - {reason}")
+        asyncio.run_coroutine_threadsafe(
+            channel.send(f"⚠️ **{label}** stopped almost immediately ({reason}). "
+                         "Check the bot console for the ffmpeg message."),
+            bot.loop,
+        )
+    return failed
+
+
+def stop_playback(guild_id, voice_client, reason="discard"):
+    """Stops whatever is playing and marks it as intentional.
+    reason "skip"    -> /loop song stops repeating it, /loop queue still sends it to the back
+    reason "discard" -> the track is dropped for good (/stop, switching to radio)"""
+    was_radio = RADIO_ACTIVE.pop(guild_id, None) is not None
+    if not was_radio:
+        STOP_REASON[guild_id] = reason
+    voice_client.stop()
+
+
+async def on_track_finished(guild, channel, track, failed):
+    reason = STOP_REASON.pop(guild.id, None)
+    mode = LOOP_MODES.get(guild.id)
+    vc = guild.voice_client
+
+    if mode and not failed and reason != "discard" and vc is not None and vc.is_connected():
+        queue = SONG_QUEUES.setdefault(guild.id, deque())
+        if mode == "song" and reason is None:
+            track.looped = True            # same song again, no "Now playing" spam
+            queue.appendleft(track)
+        elif mode == "queue":
+            track.looped = not queue       # a one-song queue repeating silently; otherwise announce each song
+            queue.append(track)
+
+    await play_next_song(guild, channel)
+
+
+def start_track(guild, vc, channel, track, seek=0.0):
+    """Starts playing a track (optionally from `seek` seconds). Raises if it can't start."""
+    source = make_audio_source(track, guild.id, seek)
+    started = time.monotonic()
+
+    def after_play(error, track=track, started=started):
+        if error:
+            print(f"Streaming error {track.title}: {error}")
+        intentional = guild.id in STOP_REASON      # skip / stop / restart, not a failure
+        failed = False if intentional else report_quick_exit(
+            channel, track.title, started, error, min_life=0 if seek else 3.0)
+        asyncio.run_coroutine_threadsafe(on_track_finished(guild, channel, track, failed), bot.loop)
+
+    try:
+        vc.play(source, after=after_play)
+    except Exception:
+        source.cleanup()
+        raise
+    PLAYBACK[guild.id] = {"track": track, "t0": started - seek, "paused_at": None}
 
 
 async def play_next_song(guild, channel):
@@ -386,30 +518,161 @@ async def play_next_song(guild, channel):
             track = queue.popleft()
             try:
                 await ensure_stream(track)
-                source = make_audio_source(track)
             except Exception as e:
                 print(f"Loading error {track.title}: {e}")
                 await channel.send(f"❌ Couldn't load **{track.title}**: {friendly_error(e)} — skipping.")
                 continue
 
-            def after_play(error, title=track.title):
-                if error:
-                    print(f"Streaming error {title}: {error}")
-                asyncio.run_coroutine_threadsafe(play_next_song(guild, channel), bot.loop)
-
             try:
-                vc.play(source, after=after_play)
+                start_track(guild, vc, channel, track)
             except Exception as e:
                 print(f"vc.play() failed for {track.title}: {e!r}")
-                source.cleanup()
                 await channel.send(f"❌ Couldn't start **{track.title}**: {e}")
                 return
 
-            await channel.send(f"▶️ Now playing: **{track.title}**")
+            if not track.looped:
+                await channel.send(f"▶️ Now playing: **{track.title}**")
+            track.looped = False
             return
 
         # queue is empty -> leave the voice channel
         await safe_disconnect(guild)
+
+
+def start_radio(guild, channel, voice_client, name, url):
+    """Starts (or restarts) a radio stream, replacing whatever is playing. Raises if it can't start."""
+    source = discord.FFmpegOpusAudio(url, bitrate=96, before_options=FFMPEG_RADIO_BEFORE,
+                                     options=audio_options(guild.id))
+
+    if voice_client.is_playing() or voice_client.is_paused():
+        stop_playback(guild.id, voice_client)
+    token = object()
+    RADIO_ACTIVE[guild.id] = (name, token, url)
+    PLAYBACK.pop(guild.id, None)
+    started = time.monotonic()
+
+    def _after_play(error):
+        current = RADIO_ACTIVE.get(guild.id)
+        if current is None or current[1] is not token:
+            return   # stopped / skipped / replaced on purpose
+        RADIO_ACTIVE.pop(guild.id, None)
+        lived = time.monotonic() - started
+        print(f"[voice] radio '{name}' ended after {lived:.1f}s, error={error}")
+        detail = f" ({error})" if error else ""
+        asyncio.run_coroutine_threadsafe(
+            channel.send(f"⚠️ **{name}** stopped after {lived:.0f}s{detail}. The stream may be offline, "
+                         "or the URL is not a direct audio stream."),
+            bot.loop,
+        )
+        asyncio.run_coroutine_threadsafe(safe_disconnect(guild), bot.loop)
+
+    try:
+        voice_client.play(source, after=_after_play)
+    except Exception:
+        RADIO_ACTIVE.pop(guild.id, None)
+        source.cleanup()
+        raise
+
+
+async def restart_current(guild, channel):
+    """ffmpeg filters can't be changed mid-stream, so re-open the current song at the same
+    position (or the radio stream) with the new settings. Returns True if something was restarted."""
+    vc = guild.voice_client
+    if vc is None or not (vc.is_playing() or vc.is_paused()):
+        return False
+    was_paused = vc.is_paused()
+
+    radio_state = RADIO_ACTIVE.get(guild.id)
+    if radio_state:
+        start_radio(guild, channel, vc, radio_state[0], radio_state[2])
+    else:
+        pb = PLAYBACK.get(guild.id)
+        if not pb:
+            return False
+        track = pb["track"]
+        position = (pb["paused_at"] or time.monotonic()) - pb["t0"]
+        await ensure_stream(track)
+        if PLAYBACK.get(guild.id) is not pb or not (vc.is_playing() or vc.is_paused()):
+            return False   # the song changed while we were refreshing its URL
+        STOP_REASON[guild.id] = "discard"    # the old stream ends on purpose: no loop re-add, no warning
+        vc.stop()
+        start_track(guild, vc, channel, track, seek=position)
+
+    if was_paused:
+        vc.pause()
+        if guild.id in PLAYBACK:
+            PLAYBACK[guild.id]["paused_at"] = time.monotonic()
+    return True
+
+
+@bot.tree.command(name="bass_boost", description="Boost the bass of songs and radio.")
+@app_commands.describe(level="Off / low / medium / high. Leave empty to switch it on (medium) or off.")
+@app_commands.choices(level=[
+    app_commands.Choice(name="Off", value="off"),
+    app_commands.Choice(name="Low", value="low"),
+    app_commands.Choice(name="Medium", value="medium"),
+    app_commands.Choice(name="High", value="high"),
+])
+async def bass_boost(interaction: discord.Interaction, level: Optional[app_commands.Choice[str]] = None):
+    await interaction.response.defer()
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("This command only works in a server.")
+        return
+
+    if level is not None:
+        new_level = level.value
+    else:
+        new_level = "off" if guild.id in BASS_LEVELS else "medium"
+
+    if new_level == "off":
+        BASS_LEVELS.pop(guild.id, None)
+        text = "🔈 Bass boost **off**."
+    else:
+        BASS_LEVELS[guild.id] = new_level
+        text = f"🔊 Bass boost **{new_level}** (+{BASS_PRESETS[new_level]} dB)."
+
+    try:
+        restarted = await restart_current(guild, interaction.channel)
+    except Exception as e:
+        print(f"Bass boost restart error: {e!r}")
+        text += f"\n⚠️ Couldn't re-open the current stream ({e}); it applies from the next song."
+    else:
+        text += "\nApplied right away." if restarted else "\nApplies to everything played from now on."
+    await interaction.followup.send(text)
+
+
+LOOP_LABELS = {
+    "off": "➡️ Loop **off** - the queue continues normally.",
+    "song": "🔂 Loop **current song** - it will repeat until you `/skip` or change the mode.",
+    "queue": "🔁 Loop **whole queue** - finished songs go to the back of the queue.",
+}
+
+
+@bot.tree.command(name="loop", description="Loop the current song or the whole queue.")
+@app_commands.describe(mode="Off / current song / whole queue. Leave empty to cycle through the modes.")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Off", value="off"),
+    app_commands.Choice(name="Current song", value="song"),
+    app_commands.Choice(name="Whole queue", value="queue"),
+])
+async def loop_cmd(interaction: discord.Interaction, mode: Optional[app_commands.Choice[str]] = None):
+    guild_id = interaction.guild_id
+    if guild_id in RADIO_ACTIVE:
+        await interaction.response.send_message("🔁 Loop doesn't apply to radio streams.")
+        return
+
+    if mode is not None:
+        new_mode = mode.value
+    else:
+        order = ["off", "song", "queue"]
+        new_mode = order[(order.index(LOOP_MODES.get(guild_id, "off")) + 1) % len(order)]
+
+    if new_mode == "off":
+        LOOP_MODES.pop(guild_id, None)
+    else:
+        LOOP_MODES[guild_id] = new_mode
+    await interaction.response.send_message(LOOP_LABELS[new_mode])
 
 
 @bot.tree.command(name="skip", description="Skips the current playing song")
@@ -418,7 +681,7 @@ async def skip(interaction: discord.Interaction):
 
     if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
         await interaction.response.send_message("⏭ Skipped!")
-        voice_client.stop()   # the after-callback starts the next song
+        stop_playback(interaction.guild_id, voice_client, reason="skip")   # the after-callback starts the next song
     else:
         await interaction.response.send_message("Not playing anything to skip.")
 
@@ -434,6 +697,8 @@ async def pause(interaction: discord.Interaction):
         return await interaction.response.send_message("Nothing is currently playing.")
 
     voice_client.pause()
+    if interaction.guild_id in PLAYBACK:
+        PLAYBACK[interaction.guild_id]["paused_at"] = time.monotonic()
     await interaction.response.send_message("Playback paused!")
 
 
@@ -448,6 +713,10 @@ async def resume(interaction: discord.Interaction):
         return await interaction.response.send_message("I'm not paused right now.")
 
     voice_client.resume()
+    pb = PLAYBACK.get(interaction.guild_id)
+    if pb and pb["paused_at"]:
+        pb["t0"] += time.monotonic() - pb["paused_at"]
+        pb["paused_at"] = None
     await interaction.response.send_message("Playback resumed!")
 
 
@@ -460,9 +729,10 @@ async def stop(interaction: discord.Interaction):
         return
 
     SONG_QUEUES.get(interaction.guild_id, deque()).clear()
+    LOOP_MODES.pop(interaction.guild_id, None)
 
     if voice_client.is_playing() or voice_client.is_paused():
-        voice_client.stop()
+        stop_playback(interaction.guild_id, voice_client)
 
     await interaction.response.send_message("Stopped playback, cleared the queue, and disconnected!")
     await safe_disconnect(interaction.guild)
@@ -484,29 +754,13 @@ async def show_queue(interaction: discord.Interaction):
 async def play(interaction: discord.Interaction, song_query: str):
     await interaction.response.defer()
 
-    if interaction.guild is None:
-        await interaction.followup.send("This command only works in a server.")
+    voice_client = await join_user_channel(interaction)
+    if voice_client is None:
         return
 
-    member = interaction.guild.get_member(interaction.user.id) or interaction.user
-    voice_state = getattr(member, "voice", None)
-
-    if voice_state is None or voice_state.channel is None:
-        await interaction.followup.send("You must be in a voice channel to use this command.")
-        return
-
-    voice_channel = voice_state.channel
-    voice_client = interaction.guild.voice_client
-
-    try:
-        if voice_client is None:
-            voice_client = await voice_channel.connect(timeout=30.0, self_deaf=True)
-        elif voice_channel != voice_client.channel:
-            await voice_client.move_to(voice_channel)
-    except Exception as e:
-        print(f"Voice connect error: {e!r}")
-        await interaction.followup.send(f"Couldn't join the voice channel: {e}")
-        return
+    # a running radio stream would block the queue forever -> replace it
+    if interaction.guild_id in RADIO_ACTIVE and (voice_client.is_playing() or voice_client.is_paused()):
+        stop_playback(interaction.guild_id, voice_client)
 
     try:
         info = await extract_info_async(song_query, YDL_OPTIONS_FLAT)
@@ -551,41 +805,82 @@ async def play(interaction: discord.Interaction, song_query: str):
 #  Radio / gif
 # --------------------------------------------------------------------------- #
 
-@bot.tree.command(name="radio", description="Play the Shinpu radio stream")
-async def radio(interaction: discord.Interaction):
+# Names that can be typed instead of a URL. Add your own favourites here.
+RADIO_PRESETS = {
+    "hikineet": (DEFAULT_RADIO_NAME, DEFAULT_RADIO_URL),
+    "default": (DEFAULT_RADIO_NAME, DEFAULT_RADIO_URL),
+}
+
+
+async def validate_stream_url(url):
+    """Only public http(s) hosts - the bot must not be usable to poke at the server's LAN."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Please give a full `http://` or `https://` stream URL.")
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(parsed.hostname, None)
+    except socket.gaierror:
+        raise ValueError(f"Couldn't resolve the host `{parsed.hostname}`.")
+    for info in infos:
+        if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
+            raise ValueError("That address is not a public host.")
+    return url
+
+
+async def resolve_radio_url(url):
+    """Validates the URL and unwraps .pls / .m3u playlist files into the real stream URL."""
+    await validate_stream_url(url)
+    if not urlparse(url).path.lower().endswith((".pls", ".m3u")):
+        return url
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as resp:
+            text = (await resp.content.read(65536)).decode("utf-8", "replace")
+
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("file1="):      # .pls format
+            line = line.split("=", 1)[1].strip()
+        if line.lower().startswith(("http://", "https://")):
+            return await validate_stream_url(line)
+    raise ValueError("Couldn't find a stream URL inside that playlist file.")
+
+
+@bot.tree.command(name="radio", description="Play a radio stream (defaults to HikiNeet Radio)")
+@app_commands.describe(station="Direct stream URL (http/https). Leave empty for HikiNeet Radio.")
+async def radio(interaction: discord.Interaction, station: Optional[str] = None):
     await interaction.response.defer()
 
-    member = interaction.guild.get_member(interaction.user.id) or interaction.user
-    voice_state = getattr(member, "voice", None)
+    station = (station or "").strip()
+    preset = RADIO_PRESETS.get(station.lower()) if station else RADIO_PRESETS["hikineet"]
+    if preset:
+        name, url = preset
+    else:
+        try:
+            url = await resolve_radio_url(station)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}")
+            return
+        except Exception as e:
+            await interaction.followup.send(f"❌ Couldn't load that station: {e}")
+            return
+        name = urlparse(url).hostname
 
-    if voice_state is None or voice_state.channel is None:
-        await interaction.followup.send("You must be in a voice channel to use this command.")
+    voice_client = await join_user_channel(interaction)
+    if voice_client is None:
         return
 
-    voice_channel = voice_state.channel
-    voice_client = interaction.guild.voice_client
-
+    # radio replaces whatever was playing and discards the song queue
+    SONG_QUEUES.get(interaction.guild_id, deque()).clear()
     try:
-        if voice_client is None:
-            voice_client = await voice_channel.connect(timeout=30.0, self_deaf=True)
-        elif voice_client.channel != voice_channel:
-            await voice_client.move_to(voice_channel)
+        start_radio(interaction.guild, interaction.channel, voice_client, name, url)
     except Exception as e:
-        await interaction.followup.send(f"Couldn't join the voice channel: {e}")
+        print(f"Radio start error: {e!r}")
+        await interaction.followup.send(f"❌ Couldn't start the stream: {e}")
         return
 
-    radio_url = "https://radio.shinpu.top/radio.ogg"
-    source = discord.FFmpegOpusAudio(radio_url, bitrate=96, before_options=FFMPEG_BEFORE, options="-vn")
-
-    if voice_client.is_playing() or voice_client.is_paused():
-        voice_client.stop()
-
-    def _after_play(error):
-        if error:
-            print(f"Radio playback error: {error}")
-
-    voice_client.play(source, after=_after_play)
-    await interaction.followup.send("📻 Now streaming: **HikiNeet Radio**")
+    await interaction.followup.send(f"📻 Now streaming: **{name}**")
 
 
 ICECAST_STATUS_URL = "https://radio.shinpu.top/status-json.xsl"
@@ -672,6 +967,14 @@ def check_environment():
         print("[env] !! ffmpeg NOT FOUND on PATH - install it, otherwise nothing can be played")
     else:
         print(f"[env] ffmpeg: {shutil.which('ffmpeg')}")
+        try:
+            encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                      capture_output=True, text=True, timeout=15).stdout
+            if "libopus" not in encoders:
+                print("[env] !! this ffmpeg build has no libopus encoder - the bot will connect "
+                      "but play SILENCE. Install a full ffmpeg build.")
+        except Exception as e:
+            print(f"[env] could not inspect ffmpeg: {e!r}")
 
     runtimes = [name for name in ("deno", "node", "bun") if shutil.which(name)]
     if runtimes:
@@ -679,6 +982,15 @@ def check_environment():
     else:
         print("[env] !! no JS runtime (deno / node v22+) on PATH - YouTube will return "
               "missing formats. Install deno: https://deno.com")
+
+    try:
+        from importlib import metadata
+        davey_ver = metadata.version("davey")
+        if davey_ver.startswith("0.") and int(davey_ver.split(".")[1]) >= 2 and discord.__version__.startswith("2.7"):
+            print(f"[env] !! davey {davey_ver} with discord.py {discord.__version__} makes the bot play in SILENCE. "
+                  "Run:  pip install \"davey>=0.1.6,<0.2\"")
+    except Exception:
+        pass
 
     for module, why in (("nacl", "PyNaCl (voice)"), ("davey", "davey (Discord voice E2EE, required)")):
         if importlib.util.find_spec(module) is None:
