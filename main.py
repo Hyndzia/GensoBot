@@ -1,4 +1,5 @@
 import asyncio
+import fnmatch
 import importlib.util
 import ipaddress
 import os
@@ -1057,10 +1058,21 @@ BOORU_IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp"}     # videos / zips can
 BOORU_BLOCKED_TAGS = {"loli", "lolicon", "shota", "shotacon", "toddlercon"}
 BOORU_RATINGS = {"g": "General", "s": "Sensitive", "q": "Questionable", "e": "Explicit"}
 BOORU_COLORS = {"g": 0x2ECC71, "s": 0xF1C40F, "q": 0xE67E22, "e": 0xE74C3C}
+# Learned at runtime: the smallest number of tags for which search strategy 1 / 2 got an HTTP 422 from
+# Danbooru, so later searches skip requests that are known to fail (saves rate limit).
+BOORU_FAILED_AT = {1: 99, 2: 99}
 
 
 class BooruError(Exception):
     """Something the user should be told about (shown as-is in chat)."""
+
+
+# Danbooru search operators such as "rating:e" or "order:score" are not plain tags; the bot sets rating
+# and ordering itself, so they are refused. (Series tags like "re:zero..." contain a colon too - those are fine.)
+BOORU_METATAG_RE = re.compile(
+    r"^[-~]?(rating|order|status|user|id|score|favcount|filetype|ratio|width|height|parent|child|source|md5|"
+    r"random|limit|date|age|tagcount|gentags|chartags|copytags|arttags|metatags|pool|fav|search|"
+    r"approver|commenter|noter|uploader|mpixels|filesize|unaffiliated|has|is):")
 
 
 def parse_booru_tags(query):
@@ -1070,7 +1082,23 @@ def parse_booru_tags(query):
     tags = [re.sub(r"\s+", "_", part.strip()) for part in parts if part.strip()]
     if len(tags) > 6 or any(len(tag) > 100 for tag in tags):
         raise BooruError("Too many / too long tags.")
+    for tag in tags:
+        if BOORU_METATAG_RE.match(tag):
+            raise BooruError(f"`{tag}` is a Danbooru search operator, not a tag - only plain tags are supported.")
     return tags
+
+
+def post_has_tags(post, tags):
+    """Client-side tag check for the case where Danbooru could only be asked for one of the tags.
+    Supports -negation and * wildcards."""
+    post_tags = (post.get("tag_string") or "").split()
+    for tag in tags:
+        negated = tag.startswith("-")
+        pattern = tag.lstrip("-~")
+        found = any(fnmatch.fnmatchcase(t, pattern) for t in post_tags)
+        if found == negated:
+            return False
+    return True
 
 
 def usable_post(post, rating):
@@ -1138,9 +1166,30 @@ async def booru_suggestions(session, tag):
         return []
 
 
+async def booru_pick_search_tag(session, tags):
+    """Without an account Danbooru can only be asked for very few tags. Ask for the RAREST positive tag
+    (most specific - usually the character) and let the bot check the remaining tags itself."""
+    candidates = [t for t in tags if not t.startswith(("-", "~"))][:4]
+    if not candidates:
+        return None
+
+    async def count(tag):
+        try:
+            async with session.get(f"{DANBOORU_URL}/counts/posts.json", params={"tags": tag}) as resp:
+                if resp.status != 200:
+                    return float("inf")
+                data = await resp.json(content_type=None)
+            return int(data.get("counts", {}).get("posts") or 0) or float("inf")
+        except Exception:
+            return float("inf")
+
+    counts = await asyncio.gather(*(count(t) for t in candidates))
+    return min(zip(counts, candidates))[1] if any(c != float("inf") for c in counts) else candidates[0]
+
+
 async def booru_random_embed(tags, rating):
     auth = aiohttp.BasicAuth(DANBOORU_LOGIN, DANBOORU_API_KEY) if DANBOORU_LOGIN and DANBOORU_API_KEY else None
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=20)
     # Danbooru rejects the default python User-Agent, so identify ourselves
     async with aiohttp.ClientSession(timeout=timeout, auth=auth,
                                      headers={"User-Agent": "GensoBot (Discord bot)"}) as session:
@@ -1151,23 +1200,41 @@ async def booru_random_embed(tags, rating):
                 if resp.status == 429:
                     raise BooruError("Danbooru says I'm sending too many requests - try again in a few seconds.")
                 if resp.status == 422:
-                    return None   # too many tags for this account type
+                    # "You cannot search for more than 2 tags at a time" - 'random' and 'rating:' can count too
+                    print(f"[booru] 422 for tags={params['tags']!r}: {(await resp.text())[:200]}")
+                    return None
                 if resp.status != 200:
                     raise BooruError(f"Danbooru answered with HTTP {resp.status}.")
                 return await resp.json(content_type=None)
 
-        # the rating is asked for server-side (so we get matching posts) ...
-        posts = await fetch(tags + [f"rating:{rating}"], 20)
-        if posts is None:
-            # ... but anonymous accounts only get 2 tags, so fall back to filtering locally
+        client_side_tags = []
+        posts = None
+        # 1) ideal: Danbooru does everything (all tags + rating)
+        if len(tags) < BOORU_FAILED_AT[1]:
+            posts = await fetch(tags + [f"rating:{rating}"], 20)
+            if posts is None:
+                BOORU_FAILED_AT[1] = min(BOORU_FAILED_AT[1], len(tags))
+        # 2) rating is checked locally instead
+        if posts is None and len(tags) < BOORU_FAILED_AT[2]:
             posts = await fetch(tags, 100)
             if posts is None:
-                raise BooruError("Danbooru allows only 2 tags per search without an account. Use fewer tags.")
+                BOORU_FAILED_AT[2] = min(BOORU_FAILED_AT[2], len(tags))
+        # 3) too many tags for an anonymous account: ask for the rarest tag only, check the rest locally
+        if posts is None:
+            main_tag = await booru_pick_search_tag(session, tags)
+            posts = await fetch([main_tag] if main_tag else [], 100)
+            client_side_tags = tags
+        if posts is None:
+            raise BooruError("Danbooru refused this search. Try fewer tags.")
 
-        valid = [post for post in posts if isinstance(post, dict) and usable_post(post, rating)]
+        valid = [p for p in posts if isinstance(p, dict) and usable_post(p, rating)
+                 and post_has_tags(p, client_side_tags)]
         if not valid:
             text = f"No **{BOORU_RATINGS[rating]}**-rated pictures found for `{', '.join(tags) or 'random'}`."
-            if tags:
+            if client_side_tags and len(tags) > 1:
+                text += ("\nWithout a Danbooru account I can only search for one tag directly and check "
+                         "the rest myself, so try fewer or more common tags.")
+            elif tags:
                 hints = await booru_suggestions(session, tags[0])
                 if hints:
                     text += "\nDid you mean: " + ", ".join(f"`{h}`" for h in hints) + "?"
