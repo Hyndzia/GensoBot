@@ -13,7 +13,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -242,6 +242,7 @@ class Track:
     stream_url: Optional[str] = None
     headers: dict = field(default_factory=dict)
     resolved_at: float = 0.0
+    duration: Optional[float] = None   # seconds, if known
     looped: bool = False   # True while being replayed by /loop (no 'Now playing' spam)
 
     def stream_is_fresh(self):
@@ -343,7 +344,7 @@ def track_from_entry(entry):
     if title in ("[Private video]", "[Deleted video]"):
         return None
 
-    track = Track(page_url=page_url, title=title)
+    track = Track(page_url=page_url, title=title, duration=entry.get("duration"))
 
     if entry.get("_type") in (None, "video") and entry.get("url") and entry.get("formats") is not None:
         url, headers = pick_stream(entry)
@@ -362,6 +363,7 @@ async def ensure_stream(track):
     if not url:
         raise RuntimeError("no playable audio stream found")
     track.stream_url, track.headers, track.resolved_at = url, headers, time.time()
+    track.duration = info.get("duration") or track.duration
 
 
 def audio_options(guild_id):
@@ -749,6 +751,129 @@ async def show_queue(interaction: discord.Interaction):
     await interaction.response.send_message("**Up next:**\n" + "\n".join(lines) + more)
 
 
+def fmt_time(seconds):
+    seconds = int(max(seconds, 0))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+async def fetch_icecast_title(session, url):
+    """Icecast servers publish the current track on /status-json.xsl - pick the entry of our mount point."""
+    parsed = urlparse(url)
+    status_url = f"{parsed.scheme}://{parsed.netloc}/status-json.xsl"
+    async with session.get(status_url, allow_redirects=False) as resp:
+        if resp.status != 200:
+            return None
+        data = await resp.json(content_type=None)
+
+    sources = data.get("icestats", {}).get("source", [])
+    if isinstance(sources, dict):
+        sources = [sources]
+    for src in sources:
+        if urlparse(src.get("listenurl", "")).path == parsed.path:
+            title, artist = src.get("title"), src.get("artist")
+            if title and artist and artist not in title:
+                return f"{artist} - {title}"
+            return title or None
+    return None
+
+
+async def fetch_icy_title(session, url):
+    """Shoutcast/Icecast in-stream metadata (ICY). Returns (title, station name)."""
+    async with session.get(url, headers={"Icy-MetaData": "1"}) as resp:
+        station = resp.headers.get("icy-name")
+        try:
+            metaint = int(resp.headers.get("icy-metaint", 0))
+        except ValueError:
+            metaint = 0
+        if not 0 < metaint <= 262144:
+            return None, station
+        await resp.content.readexactly(metaint)                 # audio data before the first metadata block
+        length = (await resp.content.readexactly(1))[0] * 16
+        if not length:
+            return None, station
+        block = (await resp.content.readexactly(length)).decode("utf-8", "replace")
+
+    match = re.search(r"StreamTitle='(.*?)';", block, re.S)
+    return ((match.group(1).strip() or None) if match else None), station
+
+
+async def fetch_radio_metadata(url):
+    """Returns (track title, station name); either can be None if the station doesn't publish it."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "GensoBot"}) as session:
+        try:
+            title = await fetch_icecast_title(session, url)
+            if title:
+                return title, None
+        except Exception as e:
+            print(f"[radio] icecast status lookup failed: {e!r}")
+        try:
+            return await fetch_icy_title(session, url)
+        except Exception as e:
+            print(f"[radio] ICY lookup failed: {e!r}")
+            return None, None
+
+
+@bot.tree.command(name="now_playing", description="Show the song or radio track that is playing right now.")
+@app_commands.guild_only()
+async def now_playing(interaction: discord.Interaction):
+    guild = interaction.guild
+    vc = guild.voice_client
+    no_pings = discord.AllowedMentions.none()   # titles come from the internet - never let them ping anyone
+
+    if vc is None or not (vc.is_playing() or vc.is_paused()):
+        await interaction.response.send_message("Nothing is playing right now.")
+        return
+
+    # ---- radio: metadata comes from the stream itself ----
+    radio_state = RADIO_ACTIVE.get(guild.id)
+    if radio_state:
+        await interaction.response.defer()
+        name, _, url = radio_state
+        title, station = await fetch_radio_metadata(url)
+        name = discord.utils.escape_markdown(station or name)
+        if title:
+            text = f"📻 **{name}**\n🎶 Now playing: **{discord.utils.escape_markdown(title)}**"
+        else:
+            text = f"📻 Streaming **{name}**\nThis station doesn't publish track information."
+        if BASS_LEVELS.get(guild.id):
+            text += f"\n🔊 Bass boost: {BASS_LEVELS[guild.id]}"
+        await interaction.followup.send(text, allowed_mentions=no_pings)
+        return
+
+    # ---- queue: we know the track and how far along it is ----
+    pb = PLAYBACK.get(guild.id)
+    if not pb:
+        await interaction.response.send_message("Something is playing, but I have no details about it.")
+        return
+
+    track = pb["track"]
+    elapsed = (pb["paused_at"] or time.monotonic()) - pb["t0"]
+    title = discord.utils.escape_markdown(track.title)
+    lines = [f"{'⏸' if vc.is_paused() else '▶️'} **Now playing:** [{title}](<{track.page_url}>)"]
+
+    if track.duration:
+        elapsed = min(elapsed, track.duration)
+        filled = round(10 * elapsed / track.duration)
+        lines.append(f"`{'▰' * filled}{'▱' * (10 - filled)}` {fmt_time(elapsed)} / {fmt_time(track.duration)}")
+    else:
+        lines.append(f"`{fmt_time(elapsed)}` elapsed")
+
+    extras = []
+    loop_mode = LOOP_MODES.get(guild.id)
+    if loop_mode:
+        extras.append("🔂 loop: song" if loop_mode == "song" else "🔁 loop: queue")
+    if BASS_LEVELS.get(guild.id):
+        extras.append(f"🔊 bass: {BASS_LEVELS[guild.id]}")
+    waiting = len(SONG_QUEUES.get(guild.id, ()))
+    extras.append(f"⏭ {waiting} in queue" if waiting else "queue is empty")
+    lines.append(" · ".join(extras))
+
+    await interaction.response.send_message("\n".join(lines), allowed_mentions=no_pings)
+
+
 @bot.tree.command(name="play", description="Play a song or playlist, or add it to the queue.")
 @app_commands.describe(song_query="Search query or playlist URL")
 async def play(interaction: discord.Interaction, song_query: str):
@@ -916,6 +1041,291 @@ async def radio_status(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.followup.send(f"❌ Error fetching radio status: {e}")
+
+
+# --------------------------------------------------------------------------- #
+#  /booru - random picture from Danbooru
+# --------------------------------------------------------------------------- #
+DANBOORU_URL = "https://danbooru.donmai.us"
+DANBOORU_LOGIN = os.getenv("DANBOORU_LOGIN") or None        # optional: higher rate limits / more tag slots
+DANBOORU_API_KEY = os.getenv("DANBOORU_API_KEY") or None
+BOORU_COOLDOWN = 3.0                                         # seconds between uses, per user
+BOORU_LAST_USE = {}                                          # user_id -> time.monotonic()
+
+BOORU_IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp"}     # videos / zips can't be shown in an embed
+# Never shown in any rating, whatever the user searches for.
+BOORU_BLOCKED_TAGS = {"loli", "lolicon", "shota", "shotacon", "toddlercon"}
+BOORU_RATINGS = {"g": "General", "s": "Sensitive", "q": "Questionable", "e": "Explicit"}
+BOORU_COLORS = {"g": 0x2ECC71, "s": 0xF1C40F, "q": 0xE67E22, "e": 0xE74C3C}
+
+
+class BooruError(Exception):
+    """Something the user should be told about (shown as-is in chat)."""
+
+
+def parse_booru_tags(query):
+    """'hatsune miku' -> ['hatsune_miku'];  'hatsune miku, solo' -> ['hatsune_miku', 'solo']."""
+    query = (query or "").strip().lower()
+    parts = query.split(",") if "," in query else [query]
+    tags = [re.sub(r"\s+", "_", part.strip()) for part in parts if part.strip()]
+    if len(tags) > 6 or any(len(tag) > 100 for tag in tags):
+        raise BooruError("Too many / too long tags.")
+    return tags
+
+
+def usable_post(post, rating):
+    """The real safety net: the rating and the blocklist are enforced HERE, on every post we got back,
+    so no search syntax the user types can sneak a different rating or a blocked tag through."""
+    if post.get("rating") != rating:
+        return False
+    if post.get("is_banned") or post.get("is_deleted"):
+        return False
+    if (post.get("file_ext") or "").lower() not in BOORU_IMAGE_EXTS:
+        return False
+    if not (post.get("large_file_url") or post.get("file_url")):
+        return False
+    return not (set((post.get("tag_string") or "").split()) & BOORU_BLOCKED_TAGS)
+
+
+def pretty_tags(tag_string, limit=4, title_case=True):
+    items = [t for t in (tag_string or "").split() if t]
+    if not items:
+        return None
+    names = [t.replace("_", " ") for t in items[:limit]]
+    if title_case:
+        names = [n.title() for n in names]
+    text = ", ".join(discord.utils.escape_markdown(n) for n in names)
+    return text + (f" +{len(items) - limit} more" if len(items) > limit else "")
+
+
+def booru_embed(post):
+    rating = post["rating"]
+    post_url = f"{DANBOORU_URL}/posts/{post['id']}"
+    characters = pretty_tags(post.get("tag_string_character"), limit=3)
+    series = pretty_tags(post.get("tag_string_copyright"), limit=3)
+    artist = pretty_tags(post.get("tag_string_artist"), limit=3, title_case=False)
+
+    embed = discord.Embed(title=characters or "Random pick", url=post_url, color=BOORU_COLORS[rating])
+    if series:
+        embed.description = f"from **{series}**"
+    embed.set_image(url=post.get("large_file_url") or post["file_url"])
+
+    if artist:
+        embed.add_field(name="🎨 Artist", value=artist, inline=True)
+    embed.add_field(name="⭐ Score", value=str(post.get("score", 0)), inline=True)
+    embed.add_field(name="❤️ Favorites", value=str(post.get("fav_count", 0)), inline=True)
+    embed.add_field(name="📐 Size", value=f"{post.get('image_width')}×{post.get('image_height')}", inline=True)
+    embed.add_field(name="🔞 Rating", value=BOORU_RATINGS[rating], inline=True)
+
+    source = post.get("source") or ""
+    if source.startswith(("http://", "https://")) and len(source) < 300:
+        embed.add_field(name="🔗 Source", value=f"[open]({source.replace(')', '%29')})", inline=True)
+    embed.set_footer(text=f"Danbooru · #{post['id']}")
+    return embed
+
+
+async def booru_suggestions(session, tag):
+    """'Did you mean' helper for searches that found nothing."""
+    try:
+        async with session.get(f"{DANBOORU_URL}/autocomplete.json",
+                               params={"search[query]": tag, "search[type]": "tag_query", "limit": 6}) as resp:
+            if resp.status != 200:
+                return []
+            items = await resp.json(content_type=None)
+        names = [str(i.get("value") or i.get("label") or "") for i in items if isinstance(i, dict)]
+        return [n for n in names if n and n != tag][:5]
+    except Exception:
+        return []
+
+
+async def booru_random_embed(tags, rating):
+    auth = aiohttp.BasicAuth(DANBOORU_LOGIN, DANBOORU_API_KEY) if DANBOORU_LOGIN and DANBOORU_API_KEY else None
+    timeout = aiohttp.ClientTimeout(total=15)
+    # Danbooru rejects the default python User-Agent, so identify ourselves
+    async with aiohttp.ClientSession(timeout=timeout, auth=auth,
+                                     headers={"User-Agent": "GensoBot (Discord bot)"}) as session:
+
+        async def fetch(search_tags, limit):
+            params = {"tags": " ".join(search_tags), "limit": limit, "random": "true"}
+            async with session.get(f"{DANBOORU_URL}/posts.json", params=params) as resp:
+                if resp.status == 429:
+                    raise BooruError("Danbooru says I'm sending too many requests - try again in a few seconds.")
+                if resp.status == 422:
+                    return None   # too many tags for this account type
+                if resp.status != 200:
+                    raise BooruError(f"Danbooru answered with HTTP {resp.status}.")
+                return await resp.json(content_type=None)
+
+        # the rating is asked for server-side (so we get matching posts) ...
+        posts = await fetch(tags + [f"rating:{rating}"], 20)
+        if posts is None:
+            # ... but anonymous accounts only get 2 tags, so fall back to filtering locally
+            posts = await fetch(tags, 100)
+            if posts is None:
+                raise BooruError("Danbooru allows only 2 tags per search without an account. Use fewer tags.")
+
+        valid = [post for post in posts if isinstance(post, dict) and usable_post(post, rating)]
+        if not valid:
+            text = f"No **{BOORU_RATINGS[rating]}**-rated pictures found for `{', '.join(tags) or 'random'}`."
+            if tags:
+                hints = await booru_suggestions(session, tags[0])
+                if hints:
+                    text += "\nDid you mean: " + ", ".join(f"`{h}`" for h in hints) + "?"
+            raise BooruError(text)
+        return booru_embed(random.choice(valid))
+
+
+def booru_cooldown_left(user_id):
+    left = BOORU_COOLDOWN - (time.monotonic() - BOORU_LAST_USE.get(user_id, 0.0))
+    if left > 0:
+        return left
+    BOORU_LAST_USE[user_id] = time.monotonic()
+    return 0.0
+
+
+class BooruView(discord.ui.View):
+    def __init__(self, owner_id, tags, rating):
+        super().__init__(timeout=180)
+        self.owner_id, self.tags, self.rating = owner_id, tags, rating
+        self.message = None
+
+    @discord.ui.button(label="Another one", emoji="🎲", style=discord.ButtonStyle.secondary)
+    async def another(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Run `/booru` yourself to get your own picture.", ephemeral=True)
+            return
+        left = booru_cooldown_left(interaction.user.id)
+        if left:
+            await interaction.response.send_message(f"Slow down - try again in {left:.0f}s.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        try:
+            embed = await booru_random_embed(self.tags, self.rating)
+        except BooruError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        except Exception as e:
+            print(f"[booru] error: {e!r}")
+            await interaction.followup.send("❌ Couldn't reach Danbooru.", ephemeral=True)
+            return
+        await interaction.edit_original_response(embed=embed, view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+@bot.tree.command(name="booru", description="Random anime picture from Danbooru, optionally for a character / tag.")
+@app_commands.describe(
+    tags="Character, series or tag, e.g. hatsune miku (several tags: separate them with commas)",
+    rating="General by default. Any other rating only works in age-restricted channels.")
+@app_commands.choices(rating=[
+    app_commands.Choice(name="General", value="g"),
+    app_commands.Choice(name="Sensitive", value="s"),
+    app_commands.Choice(name="Questionable", value="q"),
+    app_commands.Choice(name="Explicit", value="e"),
+])
+async def booru(interaction: discord.Interaction, tags: Optional[str] = None,
+                rating: Optional[app_commands.Choice[str]] = None):
+    level = rating.value if rating else "g"
+    channel = interaction.channel
+    is_nsfw = bool(getattr(channel, "is_nsfw", lambda: False)())
+    if level != "g" and not is_nsfw:
+        await interaction.response.send_message(
+            "🔞 Only **General** pictures can be posted here. "
+            "Other ratings work only in age-restricted channels.", ephemeral=True)
+        return
+
+    left = booru_cooldown_left(interaction.user.id)
+    if left:
+        await interaction.response.send_message(f"Slow down - try again in {left:.0f}s.", ephemeral=True)
+        return
+
+    try:
+        tag_list = parse_booru_tags(tags)
+    except BooruError as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        embed = await booru_random_embed(tag_list, level)
+    except BooruError as e:
+        await interaction.followup.send(str(e))
+        return
+    except Exception as e:
+        print(f"[booru] error: {e!r}")
+        await interaction.followup.send("❌ Couldn't reach Danbooru, try again later.")
+        return
+
+    view = BooruView(interaction.user.id, tag_list, level)
+    view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
+
+
+TRUN_SCAN_LIMIT = 1000   # how far back /trun looks for the user's messages
+
+
+@bot.tree.command(name="trun", description="Delete the latest X messages of a user in this channel (admins only).")
+@app_commands.default_permissions(administrator=True)   # hidden for everyone without Administrator
+@app_commands.guild_only()
+@app_commands.describe(user="Whose messages to delete", count="How many of their latest messages to delete (1-100)")
+async def trun(interaction: discord.Interaction, user: discord.User, count: app_commands.Range[int, 1, 100]):
+    # server owners can re-expose a command in Server Settings -> Integrations, so check again here
+    if not interaction.permissions.administrator:
+        await interaction.response.send_message("❌ Only administrators can use this command.", ephemeral=True)
+        return
+
+    channel = interaction.channel
+    my_perms = channel.permissions_for(interaction.guild.me)
+    if not (my_perms.manage_messages and my_perms.read_message_history):
+        await interaction.response.send_message(
+            "❌ I need the **Manage Messages** and **Read Message History** permissions in this channel.",
+            ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    found = []
+    async for message in channel.history(limit=TRUN_SCAN_LIMIT):
+        if message.author.id == user.id:
+            found.append(message)
+            if len(found) >= count:
+                break
+
+    if not found:
+        await interaction.followup.send(
+            f"No messages from **{user.display_name}** in the last {TRUN_SCAN_LIMIT} messages of this channel.")
+        return
+
+    # Discord only bulk-deletes messages younger than 14 days; older ones must be deleted one by one
+    cutoff = discord.utils.utcnow() - timedelta(days=13, hours=23)
+    recent = [m for m in found if m.created_at > cutoff]
+    old = [m for m in found if m.created_at <= cutoff]
+
+    deleted = 0
+    try:
+        for i in range(0, len(recent), 100):
+            chunk = recent[i:i + 100]
+            if len(chunk) == 1:
+                await chunk[0].delete()
+            else:
+                await channel.delete_messages(chunk, reason=f"/trun by {interaction.user}")
+            deleted += len(chunk)
+        for message in old:
+            await message.delete()
+            deleted += 1
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"⚠️ Deleted {deleted} of {len(found)} messages, then failed: {e}")
+        return
+
+    print(f"[trun] {interaction.user} deleted {deleted} messages of {user} in #{channel} ({interaction.guild.name})")
+    note = f" (only {deleted} found out of the requested {count})" if deleted < count else ""
+    await interaction.followup.send(f"🗑️ Deleted **{deleted}** message(s) from **{user.display_name}**{note}.")
 
 
 @bot.tree.command(name="gif", description="Random weeb gif!")
